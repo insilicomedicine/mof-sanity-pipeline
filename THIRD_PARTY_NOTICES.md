@@ -123,7 +123,8 @@ not distributed with this repository.
 QMOF database (test fixtures)
 -----------------------------
 
-The CIF files in `test/test_cifs/` are derived from structures in the QMOF database.
+The CIF files in `test/test_cifs/` and the reference outputs in
+`test/fixtures/smoke/` are derived from structures in the QMOF database.
 
 - Original dataset: QMOF — Quantum Metal-Organic Framework Database
 - Original authors: Andrew S. Rosen et al.  

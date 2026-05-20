@@ -8,7 +8,7 @@ import logging
 import json
 from tqdm import tqdm
 from preprocessing import FileStructure
-from utils import run_platon, run_libcif, run_framechecker
+from utils import run_platon, run_libcif, run_framechecker, run_oxichecker, HAS_PLATON
 import signal
 from contextlib import contextmanager
 import threading
@@ -32,6 +32,9 @@ class TimeoutConfig:
     libcif: int = 60           # LibCIF analysis timeout (1 minute)
     framechecker: int = 180    # FrameChecker timeout (3 minutes)
     preprocessing: int = 60     # Preprocessing timeout (1 minute)
+    oxichecker: int = 300      # OxiChecker timeout (5 minutes)
+    decomp: int = 60           # Decomposition subprocess timeout
+    obabel: int = 30           # OpenBabel subprocess timeout
 
 @contextmanager
 def time_limit(seconds: int, operation_name: str = "operation"):
@@ -144,62 +147,83 @@ def update_and_store(json_data, output_file, new_data, suffix):
          json.dump(new_data, f)
     json_data.update(new_data)
 
-def procedures(json_data, input_path, obabel_run, output_file, timeout_config: TimeoutConfig, cif_dirs=None):
-    # Preprocessing - no individual timeout, rely on global timeout
+def procedures(json_data, input_path, obabel_run, output_file, timeout_config: TimeoutConfig, cif_dirs=None, stage1_only=False, stage2_only=False):
     try:
         file_structure = FileStructure(input_path, obabel_run, cif_dirs=cif_dirs)
         update_and_store(json_data, output_file, file_structure.property_dict(), 'base')
     except Exception as e:
         logger.error(f"Preprocessing failed: {e}")
         return
-    
-    # PLATON analysis - no individual timeout, rely on global timeout
-    try:
-        if file_structure.basic_validity:
-            if file_structure.group_id == 1:
-                platon_validity, platon_data = run_platon(file_structure.p1_filepath, timeout_config.platon)
+
+    if not stage2_only:
+        try:
+            if file_structure.basic_validity:
+                libcif_data = run_libcif(file_structure.p1_filepath, timeout_config.libcif)
             else:
-                platon_validity, platon_data = run_platon(file_structure.sym_filepath, timeout_config.platon)
-        else:
-            logger.info("PyMatGen Failed. Try PLATON and LibCif on the cif init file")
-            platon_validity, platon_data = run_platon(file_structure.filepath, timeout_config.platon)
-            
-        if platon_validity:
-            update_and_store(json_data, output_file, {"platon_validity": platon_validity,
-                            "platon_data" : platon_data}, 'platon')
-        else:
-            update_and_store(json_data, output_file, {"platon_validity": platon_validity,
-                            "platon_data" : []}, 'platon')
-    except Exception as e:
-        logger.error(f"PLATON failed: {e}")
-        update_and_store(json_data, output_file, {"platon_validity": False,
-                        "platon_data": [], "platon_error": str(e)}, 'platon')
+                libcif_data = run_libcif(file_structure.filepath, timeout_config.libcif)
+            update_and_store(json_data, output_file, libcif_data, 'libcif')
+        except Exception as e:
+            logger.error(f"LibCIF failed: {e}")
+            update_and_store(json_data, output_file, {"libcif_validity": False,
+                            "libcif_out": "", "libcif_error": str(e)}, 'libcif')
+            return
     
-    # LibCIF analysis - no individual timeout, rely on global timeout
-    try:
-        if file_structure.basic_validity:
-            libcif_data = run_libcif(file_structure.p1_filepath, timeout_config.libcif)
-        else:
-            libcif_data = run_libcif(file_structure.filepath, timeout_config.libcif)
-        update_and_store(json_data, output_file, libcif_data, 'libcif')
-    except Exception as e:
-        logger.error(f"LibCIF failed: {e}")
-        update_and_store(json_data, output_file, {"libcif_validity": False, 
-                        "libcif_out": "", "libcif_error": str(e)}, 'libcif')
-    
-    # FrameChecker runs only if structure graph is available
+        if libcif_data.get("libcif_validity") is not True:
+            logger.info("Stage 1 (LibCif) rejected the structure. Skipping Stage 2.")
+            return
+        if stage1_only:
+            logger.info("stage1_only mode: Stage 1 passed. Skipping Stage 2.")
+            return
+
+    if HAS_PLATON:
+        try:
+            if file_structure.basic_validity:
+                if file_structure.group_id == 1:
+                    platon_validity, platon_data = run_platon(file_structure.p1_filepath, timeout_config.platon)
+                else:
+                    platon_validity, platon_data = run_platon(file_structure.sym_filepath, timeout_config.platon)
+            else:
+                logger.info("PyMatGen Failed. Try PLATON on the cif init file")
+                platon_validity, platon_data = run_platon(file_structure.filepath, timeout_config.platon)
+
+            if platon_validity:
+                update_and_store(json_data, output_file, {"platon_validity": platon_validity,
+                                "platon_data" : platon_data}, 'platon')
+            else:
+                update_and_store(json_data, output_file, {"platon_validity": platon_validity,
+                                "platon_data" : []}, 'platon')
+        except Exception as e:
+            logger.error(f"PLATON failed: {e}")
+            update_and_store(json_data, output_file, {"platon_validity": False,
+                            "platon_data": [], "platon_error": str(e)}, 'platon')
+    else:
+        logger.info("PLATON not available in this build (WITHOUT_PLATON); skipping PLATON stage.")
+
     if file_structure.is_graph_constructed:
         logger.info("Structure graph is constructed. Running FrameChecker")
-        
-        # FrameChecker - no individual timeout, rely on global timeout
         try:
-            frame_checker_data = run_framechecker(file_structure.matgen_structure, 
+            frame_checker_data = run_framechecker(file_structure.matgen_structure,
                                                 file_structure.graph, timeout_config.framechecker)
             update_and_store(json_data, output_file, frame_checker_data, 'framechecker')
         except Exception as e:
             logger.error(f"FrameChecker failed: {e}")
-            update_and_store(json_data, output_file, {'framecheker_validity': False, 
+            update_and_store(json_data, output_file, {'framecheker_validity': False,
                             'framecheker_results': None, 'framechecker_error': str(e)}, 'framechecker')
+
+    try:
+        cif_path_for_oxi = file_structure.p1_filepath if file_structure.basic_validity else file_structure.filepath
+        decompose_dir = Path(output_file).parent / "decompose"
+        oxi_data = run_oxichecker(cif_path_for_oxi, decompose_dir,
+                                   timeout=timeout_config.oxichecker,
+                                   decomp_timeout=timeout_config.decomp,
+                                   obabel_timeout=timeout_config.obabel)
+        update_and_store(json_data, output_file, oxi_data, 'oxichecker')
+    except Exception as e:
+        logger.error(f"OxiChecker failed: {e}")
+        update_and_store(json_data, output_file, {
+            'OxiChecker Validity': f'Processing error: {str(e)}',
+            'PATH1_InChI': '', 'PATH2_InChI': '', 'PATH3_SMILES': '', 'Valid_Path': ''
+        }, 'oxichecker')
         
 
 @click.command()
@@ -212,6 +236,34 @@ def procedures(json_data, input_path, obabel_run, output_file, timeout_config: T
 @click.option('--total-timeout', '-t', 
               help='Total execution timeout (seconds). Controls the maximum time for the entire analysis. Default 300.', 
               type=int, default=300)
+@click.option('--stage1-only',
+              help='Run only Stage 1 (LibCif fast filter). Skip Stage 2.',
+              is_flag=True, default=False)
+@click.option('--stage2-only',
+              help=(
+                  'Run only Stage 2 (PLATON/FrameChecker/OxiChecker). Skip LibCif pre-filter.'
+                  if HAS_PLATON else
+                  'Run only Stage 2 (FrameChecker/OxiChecker). Skip LibCif pre-filter.'
+              ),
+              is_flag=True, default=False)
+@click.option('--platon-timeout',
+              help='PLATON subprocess timeout (seconds). Default 120.',
+              type=int, default=120, hidden=not HAS_PLATON)
+@click.option('--libcif-timeout',
+              help='LibCif subprocess timeout (seconds). Default 60.',
+              type=int, default=60)
+@click.option('--framechecker-timeout',
+              help='FrameChecker timeout (seconds). Default 180.',
+              type=int, default=180)
+@click.option('--oxichecker-timeout',
+              help='OxiChecker full-function timeout (seconds). Default 300.',
+              type=int, default=300)
+@click.option('--decomp-timeout',
+              help='OxiChecker decomposition subprocess timeout (seconds). Default 60.',
+              type=int, default=60)
+@click.option('--obabel-timeout',
+              help='OxiChecker OpenBabel subprocess timeout (seconds). Default 30.',
+              type=int, default=30)
 @click.option('--max-workers', '-w',
               help='Maximum number of parallel workers. Defaults to number of CPU cores.',
               type=int, default=None)
@@ -222,6 +274,14 @@ def sanity_runner(input_file : str,
                   no_obabel_run : bool,
                   recursive : bool,
                   total_timeout : int,
+                  stage1_only : bool,
+                  stage2_only : bool,
+                  platon_timeout : int,
+                  libcif_timeout : int,
+                  framechecker_timeout : int,
+                  oxichecker_timeout : int,
+                  decomp_timeout : int,
+                  obabel_timeout : int,
                   max_workers: Optional[int],
                   output_dir: str) -> None:
     '''Sanity check runner for CIF files, directories, or multiple files.
@@ -247,10 +307,13 @@ Process recursively:     sanity_runner -r /path/to/cif_folder/
     '''
     timeout_config = TimeoutConfig(
         total_execution=total_timeout,
-        platon=120,  # Individual timeouts are no longer used but kept for subprocess calls
-        libcif=60,
-        framechecker=180,
-        preprocessing=60
+        platon=platon_timeout,
+        libcif=libcif_timeout,
+        framechecker=framechecker_timeout,
+        preprocessing=60,
+        oxichecker=oxichecker_timeout,
+        decomp=decomp_timeout,
+        obabel=obabel_timeout,
     )
     
     # Collect all CIF files from input (files, directories, or mixed)
@@ -298,7 +361,7 @@ Process recursively:     sanity_runner -r /path/to/cif_folder/
 
     if max_workers == 1:
         for file in tqdm(cif_files, desc="Processing CIF files"):
-            result = sanity(file, timeout_config, obabel_run, output_root)
+            result = sanity(file, timeout_config, obabel_run, output_root, stage1_only, stage2_only)
             if result:
                 failures.append((file, result))
         if failures:
@@ -310,7 +373,7 @@ Process recursively:     sanity_runner -r /path/to/cif_folder/
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         future_to_file = {
-            executor.submit(sanity, file, timeout_config, obabel_run, output_root): file
+            executor.submit(sanity, file, timeout_config, obabel_run, output_root, stage1_only, stage2_only): file
             for file in cif_files
         }
 
@@ -336,7 +399,9 @@ Process recursively:     sanity_runner -r /path/to/cif_folder/
 def sanity(input_file : str, 
            timeout_config : TimeoutConfig, 
            obabel_run : bool,
-           output_root: Path ) -> int:
+           output_root: Path,
+           stage1_only : bool = False,
+           stage2_only : bool = False) -> int:
     input_path = Path(input_file)
 
     # Create main output directory structure with 4 top-level subdirectories
@@ -385,7 +450,7 @@ def sanity(input_file : str,
     timeout_occurred = False
     try:
         with flexible_timeout(timeout_config.total_execution, "total execution", global_timeout=True):
-            procedures(json_data, input_path, obabel_run, output_file, timeout_config, cif_dirs)
+            procedures(json_data, input_path, obabel_run, output_file, timeout_config, cif_dirs, stage1_only=stage1_only, stage2_only=stage2_only)
     except (GlobalTimeoutException, KeyboardInterrupt) as e:
         logger.error(f"Total execution timeout exceeded {timeout_config.total_execution}s. Stopping analysis.")
         timeout_occurred = True

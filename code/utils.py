@@ -19,6 +19,11 @@ from process_tracker import _active_processes, _process_lock
 PLATON_BINARY_PATH = '/code/platon'
 LIBCIF_BINARY_PATH = "/opt/libcif/bin/cif_check"
 
+# True if the image was built with PLATON, False if built with --build-arg
+# WITHOUT_PLATON=1. All PLATON-touching code paths key off this flag so the
+# pipeline can run end-to-end without the PLATON binary.
+HAS_PLATON = os.path.exists(PLATON_BINARY_PATH)
+
 def run_platon(filepath, timeout: int = 120) -> tuple[bool, list[str]]:
     filepath = str(filepath)
     logger.info("Running PLATON analyzer")
@@ -80,7 +85,11 @@ def run_libcif(filepath, timeout: int = 60):
                 if run in _active_processes:
                     _active_processes.remove(run)
         logger.info("Finished LIBCIF")
-        return {"libcif_validity": True, 'libcif_out': out,  "libcif_error" : err}
+        first_word = out.strip().split()[0] if out.strip() else ""
+        is_valid = first_word == "OK"
+        if not is_valid and "graph" in err.lower():
+            is_valid = True
+        return {"libcif_validity": is_valid, 'libcif_out': out, "libcif_error": err}
     except s.TimeoutExpired as e:
         logger.error(f"LibCIF analysis timed out after {timeout} seconds: {e}")
         try:
@@ -121,3 +130,106 @@ def run_framechecker(structure, graph, timeout: int = 180):
         logger.error(f"FrameChecker Failed: {e}")
         return {'framecheker_validity' : False, 'framecheker_results' : None, 'framechecker_error': str(e)}
         
+def _oxichecker_worker(args_tuple, result_queue):
+    try:
+        import sys
+        if '/opt/oxichecker' not in sys.path:
+            sys.path.insert(0, '/opt/oxichecker')
+        from main import validate_mof_worker
+        result = validate_mof_worker(args_tuple)
+        result_queue.put(result)
+    except Exception as e:
+        from pathlib import Path as _P
+        cif_path = args_tuple[0]
+        result_queue.put({
+            'cif': _P(cif_path).name,
+            'OxiChecker Validity': f'Processing error: {str(e)}',
+            'PATH1_InChI': '',
+            'PATH2_InChI': '',
+            'PATH3_SMILES': '',
+            'Valid_Path': ''
+        })
+
+
+def run_oxichecker(cif_path, decompose_dir, timeout: int = 300,
+                   decomp_timeout: int = 60, obabel_timeout: int = 30):
+    from pathlib import Path
+    from multiprocessing import Process, Queue
+    import sys
+
+    logger.info("Running OxiChecker")
+
+    if '/opt/oxichecker' not in sys.path:
+        sys.path.insert(0, '/opt/oxichecker')
+    from main import CIF_TO_BB_PATH
+
+    cif_path = Path(cif_path)
+    decompose_dir = Path(decompose_dir)
+    decompose_dir.mkdir(exist_ok=True, parents=True)
+
+    decomp_params = ['0.5', '5.0', '-0.45', 'jmol']
+    args_tuple = (
+        cif_path,
+        CIF_TO_BB_PATH,
+        decomp_params,
+        True,
+        decompose_dir,
+        False,
+        decomp_timeout,
+        obabel_timeout,
+    )
+
+    fallback = {
+        'cif': cif_path.name,
+        'OxiChecker Validity': 'Processing timeout',
+        'PATH1_InChI': '',
+        'PATH2_InChI': '',
+        'PATH3_SMILES': '',
+        'Valid_Path': ''
+    }
+
+    if timeout <= 0:
+        from main import validate_mof_worker
+        try:
+            result = validate_mof_worker(args_tuple)
+            logger.info("Finished OxiChecker")
+            return result
+        except Exception as e:
+            logger.error(f"OxiChecker failed: {e}")
+            return {
+                'cif': cif_path.name,
+                'OxiChecker Validity': f'Processing error: {str(e)}',
+                'PATH1_InChI': '',
+                'PATH2_InChI': '',
+                'PATH3_SMILES': '',
+                'Valid_Path': ''
+            }
+
+    result_queue = Queue()
+    p = Process(target=_oxichecker_worker, args=(args_tuple, result_queue))
+    p.start()
+    p.join(timeout=timeout)
+
+    if p.is_alive():
+        logger.error(f"OxiChecker timed out after {timeout}s, terminating")
+        p.terminate()
+        p.join(timeout=5)
+        if p.is_alive():
+            p.kill()
+            p.join()
+        return fallback
+
+    if not result_queue.empty():
+        result = result_queue.get()
+        logger.info("Finished OxiChecker")
+        return result
+
+    logger.error("OxiChecker process finished but produced no result")
+    return {
+        'cif': cif_path.name,
+        'OxiChecker Validity': 'Processing error: no result',
+        'PATH1_InChI': '',
+        'PATH2_InChI': '',
+        'PATH3_SMILES': '',
+        'Valid_Path': ''
+    }

@@ -33,7 +33,6 @@ LLM_generated_cifs/
 
 # Local runs / experiments
 out/
-**/*results*
 
 # Docker itself
 Dockerfile

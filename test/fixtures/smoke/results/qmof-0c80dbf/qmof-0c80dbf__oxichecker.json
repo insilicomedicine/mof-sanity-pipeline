@@ -1,0 +1,1 @@
+{"cif": "qmof-0c80dbf.cif", "OxiChecker Validity": "True", "PATH1_InChI": "linker0.xyz: InChI=1S/C7H6N6O/c1-3-8-6(12-10-3)5(14)7-9-4(2)11-13-7/h1-2H3", "PATH2_InChI": "linker0.xyz: InChI=1S/C7H6N6O/c1-3-8-6(12-10-3)5(14)7-9-4(2)11-13-7/h1-2H3", "PATH3_SMILES": "linker0.xyz: CC1=NN=C(C(=O)C2=NC(C)=N[N]2)[N]1", "Valid_Path": "linker0.xyz:\\PATH3(PATH1,PATH2)\\"}

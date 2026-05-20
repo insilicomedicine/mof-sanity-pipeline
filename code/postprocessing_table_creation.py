@@ -11,6 +11,8 @@ from joblib import Parallel, delayed
 import click
 from typing import List, Tuple
 
+from utils import HAS_PLATON
+
 equality = lambda x1, x2, tol=0.02: True if abs(x1 - x2)<=tol else False
 full_equality = lambda x1, List_x2, tol=0.02: True if any([equality(x1,x2,tol) for x2 in List_x2] ) else False
 
@@ -113,20 +115,25 @@ def single_json_parser(result_dir_path, cif_stem):
                     'structure_hash',
                     'is_graph_constructed',
                     'graph_dim', 'platon_validity',
-                    'libcif_validity', 'framecheker_validity']:
+                    'libcif_validity', 'framecheker_validity',
+                    'OxiChecker Validity', 'PATH1_InChI', 'PATH2_InChI',
+                    'PATH3_SMILES', 'Valid_Path']:
             if key in data:
                 tmp_dict[key] = data[key]
             if key == 'basic_validity':
                 if not isinstance(data[key], bool):
                     print(data)
-        if 'platon_validity' in tmp_dict and tmp_dict['platon_validity']:
-            platon_bad_lines = len([x for x in data['platon_data'] if "Unusual sp" in x])
-            if platon_bad_lines>0:
-                tmp_dict['platon_condition_is_good'] = False
+        if HAS_PLATON:
+            if 'platon_validity' in tmp_dict and tmp_dict['platon_validity']:
+                platon_bad_lines = len([x for x in data['platon_data'] if "Unusual sp" in x])
+                if platon_bad_lines>0:
+                    tmp_dict['platon_condition_is_good'] = False
+                else:
+                    tmp_dict['platon_condition_is_good'] = True
             else:
-                tmp_dict['platon_condition_is_good'] = True
-        else:
-            tmp_dict['platon_condition_is_good'] = None
+                tmp_dict['platon_condition_is_good'] = None
+        # When the image was built WITHOUT_PLATON, no platon data is produced
+        # and the PLATON Validity column is omitted from the final CSV entirely.
 
         if 'libcif_validity' in tmp_dict and tmp_dict['libcif_validity']:
             libcif_out = data.get('libcif_out', '').strip()
@@ -265,9 +272,21 @@ def main(folder: str, n_jobs: int, output: str, oxichecker_path: str):
     df = df.rename(columns = {'basic_validity' : "Basic Validity", "libcif_result" : "LibCif Validity",
 "platon_condition_is_good" : "PLATON Validity", 'libcif_warning': 'LibCif_Warning'})
 
-    for validity_col in ["Basic Validity", "PLATON Validity"]:
+    validity_cols_to_normalise = ["Basic Validity"]
+    if HAS_PLATON:
+        validity_cols_to_normalise.append("PLATON Validity")
+
+    def _normalize_validity(value):
+        # None / NaN means the check was skipped (e.g. PLATON skipped after a
+        # Stage 1 LibCif rejection). Without this guard, `astype(bool)` would
+        # cast None to False and hide skipped checks among real failures.
+        if pd.isna(value):
+            return "Check not performed"
+        return bool(value)
+
+    for validity_col in validity_cols_to_normalise:
         if validity_col in df.columns:
-            df[validity_col] = df[validity_col].astype(bool).fillna("Check not performed")
+            df[validity_col] = df[validity_col].apply(_normalize_validity)
         else:
             df[validity_col] = "Check not performed"
 
@@ -295,16 +314,15 @@ def main(folder: str, n_jobs: int, output: str, oxichecker_path: str):
     checker_keys = ['HAS_ATOMIC_OVERLAPS', 'HAS_OVERCOORDINATED_C', 'HAS_OVERCOORDINATED_H',
                     'HAS_OVERCOORDINATED_N', 'HAS_LONE_MOLECULE', 'HAS_BAD_RARE_EARTH',
                     'HAS_BAD_ALKALI_ALKALINE', 'HAS_BAD_TERMINAL_OXO']
-
+    renamer = {x : x.lower().replace("_", " ") for x in checker_keys}
+    df = df.rename(columns = renamer)
     for key in checker_keys:
-        renamer = {x : x.lower().replace("_", " ") for x in checker_keys}
-        df = df.rename(columns = renamer)
-        df[renamer[key]] = df[renamer[key]].astype(bool).fillna("Check not performed")
+        col = renamer[key]
+        if col in df.columns:
+            df[col] = df[col].astype(bool).fillna("Check not performed")
+        else:
+            df[col] = "Check not performed"
     
-    # Save intermediate CSV before OxiChecker merge
-    intermediate_output = output.replace('.csv', '_pre_oxichecker.csv')
-    df.to_csv(intermediate_output, index=False)
-    click.echo(f"Intermediate results (before OxiChecker merge) saved to {intermediate_output}")
 
     if oxichecker_path:
         click.echo(f"Loading OxiChecker data from '{oxichecker_path}'...")
@@ -356,38 +374,51 @@ def main(folder: str, n_jobs: int, output: str, oxichecker_path: str):
             click.echo(f"Error loading OxiChecker data: {e}")
             df['OxiChecker Validity'] = 'Error loading OxiChecker data'
     else:
-        df['OxiChecker Validity'] = 'Not processed'
+        if 'OxiChecker Validity' not in df.columns:
+            df['OxiChecker Validity'] = 'Not processed'
+        else:
+            df['OxiChecker Validity'] = df['OxiChecker Validity'].fillna('Not processed')
 
-    df = df [ ['cif'] + [x for x in ['content_hash', 'formula', 'reduced_formula',
+    column_order = ['content_hash', 'formula', 'reduced_formula',
         'density', 'volume', 'group_str', 'group_id', 'structure_hash_strict',
         'structure_hash', 'is_graph_constructed', 'graph_dim',  'HAS_OMS',
         'DECORATED_GRAPH_HASH', 'UNDECORATED_GRAPH_HASH',
         'DECORATED_SCAFFOLD_HASH', 'UNDECORATED_SCAFFOLD_HASH',
-            'Basic Validity', 'LibCif Validity', 'LibCif_Warning', 'PLATON Validity', 'OxiChecker Validity',
+            'Basic Validity', 'LibCif Validity', 'LibCif_Warning', 'OxiChecker Validity',
         'has atomic overlaps', 'has overcoordinated c', 'has overcoordinated h',
         'has overcoordinated n', 'has lone molecule', 'has bad rare earth',
-        'has bad alkali alkaline', 'has bad terminal oxo'] if x in df.columns ] ]
+        'has bad alkali alkaline', 'has bad terminal oxo']
+    if HAS_PLATON:
+        # Insert PLATON Validity after LibCif_Warning for visual continuity.
+        idx = column_order.index('LibCif_Warning') + 1
+        column_order.insert(idx, 'PLATON Validity')
+    df = df [ ['cif'] + [x for x in column_order if x in df.columns ] ]
 
-    main_validity_cols = ["Basic Validity", "LibCif Validity", "PLATON Validity"]
-    for col in main_validity_cols:
-        if col in df.columns and df[col].dtype == object:
-            df.loc[df[col] == "Check not performed", col] = False
-    
+    main_validity_cols = ["Basic Validity", "LibCif Validity"]
+    if HAS_PLATON:
+        main_validity_cols.append("PLATON Validity")
+
     if 'OxiChecker Validity' in df.columns:
         oxichecker_good = df['OxiChecker Validity'].astype(str).str.contains('True', na=False)
     else:
         oxichecker_good = pd.Series([False] * len(df), index=df.index)
 
+    # Sanity uses `== True` on validity columns so that "Check not performed"
+    # (= stage skipped) and False both fail the conjunction, while the column
+    # itself in the CSV keeps the friendly "Check not performed" marker.
     ok_cond = np.logical_and.reduce(
         [df[key]!=True for key in [x.lower().replace("_", " ") for x in checker_keys] if key in df.columns] + \
-        [df[key]!=False for key in main_validity_cols if key in df.columns] + \
+        [df[key]==True for key in main_validity_cols if key in df.columns] + \
         [np.logical_or(oxichecker_good, df['OxiChecker Validity'] == 'Not processed')]
     )
     
     df.loc[:, 'Sanity'] = ok_cond
     
     # Reorder columns to put validation results first
-    validation_cols = ['cif', 'Basic Validity', 'LibCif Validity', 'LibCif_Warning', 'PLATON Validity', 'OxiChecker Validity', 'Sanity']
+    validation_cols = ['cif', 'Basic Validity', 'LibCif Validity', 'LibCif_Warning']
+    if HAS_PLATON:
+        validation_cols.append('PLATON Validity')
+    validation_cols.extend(['OxiChecker Validity', 'Sanity'])
     existing_validation_cols = [col for col in validation_cols if col in df.columns]
     other_cols = [col for col in df.columns if col not in existing_validation_cols]
     df = df[existing_validation_cols + other_cols]
@@ -399,7 +430,8 @@ def main(folder: str, n_jobs: int, output: str, oxichecker_path: str):
     basic_valid = (df['Basic Validity'] == True).sum() if 'Basic Validity' in df.columns else 0
     libcif_valid = (df['LibCif Validity'] == True).sum() if 'LibCif Validity' in df.columns else 0
     platon_valid = (df['PLATON Validity'] == True).sum() if 'PLATON Validity' in df.columns else 0
-    
+    platon_processed = df['PLATON Validity'].isin([True, False]).sum() if 'PLATON Validity' in df.columns else 0
+
     # OxiChecker validity counting
     oxichecker_valid = 0
     oxichecker_processed = 0
@@ -414,7 +446,10 @@ def main(folder: str, n_jobs: int, output: str, oxichecker_path: str):
     click.echo(f"Total structures: {total_structures}")
     click.echo(f"Basic validity: {basic_valid}/{total_structures} ({100*basic_valid/total_structures:.1f}%)")
     click.echo(f"LibCif validity: {libcif_valid}/{total_structures} ({100*libcif_valid/total_structures:.1f}%)")
-    click.echo(f"PLATON validity: {platon_valid}/{total_structures} ({100*platon_valid/total_structures:.1f}%)")
+    if HAS_PLATON:
+        click.echo(f"PLATON processed: {platon_processed}/{total_structures} ({100*platon_processed/total_structures:.1f}%)")
+        platon_denom = platon_processed if platon_processed > 0 else 1
+        click.echo(f"PLATON validity: {platon_valid}/{platon_denom} ({100*platon_valid/platon_denom:.1f}%)")
     click.echo(f"OxiChecker processed: {oxichecker_processed}/{total_structures} ({100*oxichecker_processed/total_structures:.1f}%)")
     click.echo(f"OxiChecker valid: {oxichecker_valid}/{oxichecker_processed if oxichecker_processed > 0 else 1} ({100*oxichecker_valid/(oxichecker_processed if oxichecker_processed > 0 else 1):.1f}%)")
     click.echo(f"Overall sanity: {sanity_passed}/{total_structures} ({100*sanity_passed/total_structures:.1f}%)")

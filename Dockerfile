@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         openbabel \
         gosu \
         ca-certificates
-
+        
 # Conda packages.
 RUN conda install -y -n base -c conda-forge \
         pymatgen=2025.2.18 \
@@ -98,25 +98,32 @@ RUN cmake -S . -B build/ --fresh -DLIBCIF_BLAKE2=ON \
     && cp build/examples/cif_to_building_blocks_v3 /opt/libcif/bin/ \
     && cp build/examples/cif_check                 /opt/libcif/bin/
 
-# PLATON requires user-supplied license-restricted sources in code/.
-# Static gfortran/gcc linkage + rpath to conda's libquadmath so the binary
-# runs in the runtime stage (which has gfortran purged for image size).
+# PLATON requires user-supplied license-restricted sources in code/. To build
+# without PLATON entirely, pass `--build-arg WITHOUT_PLATON=1` — the runtime
+# will detect the missing binary and skip PLATON in every code path.
+ARG WITHOUT_PLATON=
 COPY code/ /opt/project/code/
 WORKDIR /opt/project/code
-RUN if [ ! -f platon.f.gz ] || [ ! -f xdrvr.c.gz ]; then \
+RUN if [ -n "$WITHOUT_PLATON" ]; then \
+        echo "WITHOUT_PLATON=$WITHOUT_PLATON: skipping PLATON compilation"; \
+        rm -f platon.f.gz xdrvr.c.gz platon.f xdrvr.c platon; \
+    elif [ ! -f platon.f.gz ] || [ ! -f xdrvr.c.gz ]; then \
         echo "ERROR: PLATON sources not found in code/"; \
         echo "Comply with the PLATON license and download platon.f.gz and xdrvr.c.gz from https://www.platonsoft.nl/platon/pl030000.html"; \
         echo "and place them in the code/ directory before building."; \
+        echo ""; \
+        echo "To build without PLATON instead, pass --build-arg WITHOUT_PLATON=1"; \
         exit 1; \
-    fi \
-    && gzip -d platon.f.gz \
-    && gzip -d xdrvr.c.gz \
-    && gfortran -O3 -march=native -mtune=native --verbose \
-            -static-libgfortran -static-libgcc \
-            -Wl,-rpath,/opt/conda/lib \
-            -o platon platon.f xdrvr.c \
-            -L/usr/X11R6/lib -lX11 \
-    && rm -f platon.f xdrvr.c
+    else \
+        gzip -d platon.f.gz \
+        && gzip -d xdrvr.c.gz \
+        && gfortran -O3 -march=native -mtune=native --verbose \
+                -static-libgfortran -static-libgcc \
+                -Wl,-rpath,/opt/conda/lib \
+                -o platon platon.f xdrvr.c \
+                -L/usr/X11R6/lib -lX11 \
+        && rm -f platon.f xdrvr.c; \
+    fi
 
 
 # =============================================================================
@@ -127,7 +134,7 @@ FROM sanity_runtime AS runtime
 
 LABEL org.opencontainers.image.title="mof-sanity-pipeline" \
       org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.version="paper"
+      org.opencontainers.image.version="1.0.1"
 
 # Build artefacts from the builder stage.
 COPY --from=builder /opt/libcif/bin    /opt/libcif/bin
@@ -146,18 +153,6 @@ RUN chmod +x \
         /usr/local/bin/docker-entrypoint.sh \
     && /usr/local/bin/generate_entrypoint.sh \
     && chmod 755 /entrypoint.sh
-
-# Optional CLI smoke tests baked into the build. Pass:
-#   docker build --build-arg RUN_ENTRYPOINT_TESTS=yes .
-# Test CIFs are baked in only when this flag is enabled.
-ARG RUN_ENTRYPOINT_TESTS=no
-ENV RUN_ENTRYPOINT_TESTS=${RUN_ENTRYPOINT_TESTS}
-COPY test/test_cifs/ /opt/test_cifs/
-RUN set -e; \
-    case "$RUN_ENTRYPOINT_TESTS" in \
-      [Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1) DATA_DIR=/opt/test_cifs /usr/local/bin/run_cli_smoke.sh;; \
-      *) echo "Skipping CLI smoke tests (RUN_ENTRYPOINT_TESTS=$RUN_ENTRYPOINT_TESTS)";; \
-    esac
 
 # Pre-compile Python sources to bytecode for faster startup.
 RUN python3 -m compileall /opt/oxichecker/ /code/ -b \
@@ -188,7 +183,60 @@ ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 
 # =============================================================================
+# Optional smoke-test stage. Run with:
+#     docker build --target smoke-test .
+# Test fixtures are confined to this stage so the runtime image stays lean.
+# =============================================================================
+FROM runtime AS smoke-test
+COPY test/test_cifs/ /opt/test_cifs/
+# Per-CIF JSON fixtures live in /opt/test_fixtures and are shared between the
+# two build modes (PLATON-only stage JSON gets skipped when WITHOUT_PLATON).
+# CSV fixtures differ between modes — the no-platon variants are kept in a
+# separate tree so the smoke script can pick the right one at runtime.
+COPY test/fixtures/smoke/           /opt/test_fixtures/
+COPY test/fixtures/smoke_no_platon/ /opt/test_fixtures_no_platon/
+
+# Tunable smoke-test parameters. Override at build time, e.g.:
+#   docker build --target smoke-test --build-arg SMOKE_NJOBS=8 .
+#   docker build --target smoke-test --build-arg SMOKE_TOTAL_TIMEOUT=240 .
+#   docker build --target smoke-test --build-arg WITHOUT_PLATON=1 .
+ARG SMOKE_NJOBS=4
+ARG SMOKE_TOTAL_TIMEOUT=600
+ARG WITHOUT_PLATON=
+
+# Each smoke step is its own RUN so BuildKit shows pass/fail per stage in the
+# build progress output. State persists in /var/smoke between RUNs.
+ENV DATA_DIR=/opt/test_cifs \
+    FIXTURES_DIR=/opt/test_fixtures \
+    FIXTURES_NO_PLATON_DIR=/opt/test_fixtures_no_platon \
+    STATE_DIR=/var/smoke \
+    SMOKE_NJOBS=${SMOKE_NJOBS} \
+    SMOKE_TOTAL_TIMEOUT=${SMOKE_TOTAL_TIMEOUT} \
+    WITHOUT_PLATON=${WITHOUT_PLATON}
+RUN ln -sf /usr/local/bin/run_cli_smoke.sh /smoke
+
+RUN /smoke prepare
+RUN /smoke help
+RUN /smoke check-help-content
+RUN /smoke negative-unknown-flag
+RUN /smoke negative-missing-input
+RUN /smoke sanity-only
+RUN /smoke check-stage-jsons
+RUN /smoke oxichecker-only
+RUN /smoke check-oxichecker-csv
+RUN /smoke postprocess-only
+RUN /smoke check-sanity-csv
+RUN /smoke stage1-only
+RUN /smoke single-file-input
+RUN /smoke recursive
+RUN /smoke custom-post-output
+RUN /smoke no-obabel-run
+RUN /smoke timeout-soft
+RUN /smoke idempotency
+RUN echo "ALL OK"
+
+# =============================================================================
 # Default target. Identical to `runtime`; placed last so `docker build .`
-# without `--target` produces the runtime image.
+# without `--target` produces the runtime image, not the smoke-test one.
 # =============================================================================
 FROM runtime AS final
