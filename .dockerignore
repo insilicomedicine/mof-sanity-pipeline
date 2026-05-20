@@ -1,0 +1,40 @@
+# VCS / editor metadata
+.git
+.gitignore
+.gitattributes
+.github
+.vscode
+.idea
+*.swp
+*.swo
+.DS_Store
+
+# Docs / scratch files (not needed inside the image)
+*.md
+THIRD_PARTY_NOTICES.md
+LICENSE
+
+# Local build artefacts
+libcif/build
+libcif/cmake-build-*
+**/__pycache__
+**/*.pyc
+**/*.pyo
+
+# Local Python venvs / caches
+.venv
+venv
+.mypy_cache
+.pytest_cache
+
+# Data bundles (used at runtime, not at build)
+LLM_generated_cifs.zip
+LLM_generated_cifs/
+
+# Local runs / experiments
+out/
+**/*results*
+
+# Docker itself
+Dockerfile
+.dockerignore

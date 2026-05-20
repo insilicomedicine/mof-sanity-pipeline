@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Saudi Aramco -- MIT License.
+# See repository LICENSE for full terms.
+import click
+from pathlib import Path
+import logging
+import json
+from tqdm import tqdm
+from preprocessing import FileStructure
+from utils import run_platon, run_libcif, run_framechecker
+import signal
+from contextlib import contextmanager
+import threading
+import _thread
+from dataclasses import dataclass
+from typing import Optional, List
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+class TimeoutException(Exception): pass
+class GlobalTimeoutException(Exception): pass
+
+# Import global process tracking
+from process_tracker import _active_processes, _process_lock
+
+@dataclass
+class TimeoutConfig:
+    """Configuration for various timeout limits"""
+    total_execution: int = 300  # Total execution timeout (5 minutes)
+    platon: int = 120          # PLATON analysis timeout (2 minutes)
+    libcif: int = 60           # LibCIF analysis timeout (1 minute)
+    framechecker: int = 180    # FrameChecker timeout (3 minutes)
+    preprocessing: int = 60     # Preprocessing timeout (1 minute)
+
+@contextmanager
+def time_limit(seconds: int, operation_name: str = "operation"):
+    """Signal-based timeout context manager"""
+    def signal_handler(signum, frame):
+        raise TimeoutException(f"{operation_name} timed out after {seconds} seconds!")
+    
+    old_handler = signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+@contextmanager
+def thread_timeout(seconds: int, operation_name: str = "operation", global_timeout: bool = False):
+    """Thread-based timeout context manager as fallback"""
+    def timeout_handler():
+        # Kill all active processes before interrupting main thread
+        logger.error(f"TIMEOUT: {operation_name} exceeded {seconds} seconds, forcing interrupt")
+        with _process_lock:
+            for process in _active_processes[:]:
+                try:
+                    if process.poll() is None:  # Process is still running
+                        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                        try:
+                            process.wait(timeout=2)
+                        except:
+                            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except (ProcessLookupError, AttributeError):
+                    pass
+            _active_processes.clear()
+        _thread.interrupt_main()
+    
+    timer = threading.Timer(seconds, timeout_handler)
+    timer.start()
+    try:
+        yield
+    except KeyboardInterrupt:
+        if global_timeout:
+            raise GlobalTimeoutException(f"{operation_name} timed out after {seconds} seconds!")
+        else:
+            raise TimeoutException(f"{operation_name} timed out after {seconds} seconds!")
+    finally:
+        timer.cancel()
+
+@contextmanager
+def flexible_timeout(seconds: int, operation_name: str = "operation", use_signal: bool = False, global_timeout: bool = False):
+    """Flexible timeout that can use either signal or thread-based approach"""
+    if seconds <= 0:
+        # If timeout is 0 or negative, don't apply timeout
+        yield
+        return
+        
+    # Use thread-based timeout by default as it's more reliable for complex operations
+    if use_signal:
+        try:
+            with time_limit(seconds, operation_name):
+                yield
+        except (OSError, ValueError):
+            # Signal-based timeout not available (e.g., in threads), fall back to thread-based
+            logger.warning(f"Signal-based timeout failed for {operation_name}, using thread-based timeout")
+            with thread_timeout(seconds, operation_name, global_timeout):
+                yield
+    else:
+        with thread_timeout(seconds, operation_name, global_timeout):
+            yield
+
+logger = logging.getLogger(__name__)
+
+def collect_cif_files(input_paths: List[str], recursive: bool = False) -> List[str]:
+    """Collect all CIF files from input paths (files or directories)."""
+    all_cif_files = []
+    
+    for input_path in input_paths:
+        path = Path(input_path)
+        
+        if path.is_file():
+            # Single file
+            if path.suffix.lower() in ['.cif']:
+                all_cif_files.append(str(path.resolve()))
+            else:
+                logger.warning(f"Skipping non-CIF file: {input_path}")
+        elif path.is_dir():
+            # Directory - search for both .cif and .CIF files in one go
+            found_files = []
+            for pattern in ["*.cif", "*.CIF"]:
+                if recursive:
+                    pattern = f"**/{pattern}"
+                found_files.extend(path.glob(pattern))
+            
+            if found_files:
+                # Convert to absolute paths to ensure proper deduplication
+                resolved_files = [str(f.resolve()) for f in found_files]
+                all_cif_files.extend(resolved_files)
+                logger.info(f"Found {len(found_files)} CIF files in {input_path}")
+            else:
+                logger.warning(f"No CIF files found in directory: {input_path}")
+        else:
+            logger.error(f"Input path does not exist: {input_path}")
+    
+    # Remove duplicates from the entire collection using resolved absolute paths
+    unique_cif_files = list(dict.fromkeys(all_cif_files))
+    
+    return unique_cif_files
+
+def update_and_store(json_data, output_file, new_data, suffix):
+    with open(str(output_file).replace(".json",f"__{suffix}.json"), 'w') as f:
+         json.dump(new_data, f)
+    json_data.update(new_data)
+
+def procedures(json_data, input_path, obabel_run, output_file, timeout_config: TimeoutConfig, cif_dirs=None):
+    # Preprocessing - no individual timeout, rely on global timeout
+    try:
+        file_structure = FileStructure(input_path, obabel_run, cif_dirs=cif_dirs)
+        update_and_store(json_data, output_file, file_structure.property_dict(), 'base')
+    except Exception as e:
+        logger.error(f"Preprocessing failed: {e}")
+        return
+    
+    # PLATON analysis - no individual timeout, rely on global timeout
+    try:
+        if file_structure.basic_validity:
+            if file_structure.group_id == 1:
+                platon_validity, platon_data = run_platon(file_structure.p1_filepath, timeout_config.platon)
+            else:
+                platon_validity, platon_data = run_platon(file_structure.sym_filepath, timeout_config.platon)
+        else:
+            logger.info("PyMatGen Failed. Try PLATON and LibCif on the cif init file")
+            platon_validity, platon_data = run_platon(file_structure.filepath, timeout_config.platon)
+            
+        if platon_validity:
+            update_and_store(json_data, output_file, {"platon_validity": platon_validity,
+                            "platon_data" : platon_data}, 'platon')
+        else:
+            update_and_store(json_data, output_file, {"platon_validity": platon_validity,
+                            "platon_data" : []}, 'platon')
+    except Exception as e:
+        logger.error(f"PLATON failed: {e}")
+        update_and_store(json_data, output_file, {"platon_validity": False,
+                        "platon_data": [], "platon_error": str(e)}, 'platon')
+    
+    # LibCIF analysis - no individual timeout, rely on global timeout
+    try:
+        if file_structure.basic_validity:
+            libcif_data = run_libcif(file_structure.p1_filepath, timeout_config.libcif)
+        else:
+            libcif_data = run_libcif(file_structure.filepath, timeout_config.libcif)
+        update_and_store(json_data, output_file, libcif_data, 'libcif')
+    except Exception as e:
+        logger.error(f"LibCIF failed: {e}")
+        update_and_store(json_data, output_file, {"libcif_validity": False, 
+                        "libcif_out": "", "libcif_error": str(e)}, 'libcif')
+    
+    # FrameChecker runs only if structure graph is available
+    if file_structure.is_graph_constructed:
+        logger.info("Structure graph is constructed. Running FrameChecker")
+        
+        # FrameChecker - no individual timeout, rely on global timeout
+        try:
+            frame_checker_data = run_framechecker(file_structure.matgen_structure, 
+                                                file_structure.graph, timeout_config.framechecker)
+            update_and_store(json_data, output_file, frame_checker_data, 'framechecker')
+        except Exception as e:
+            logger.error(f"FrameChecker failed: {e}")
+            update_and_store(json_data, output_file, {'framecheker_validity': False, 
+                            'framecheker_results': None, 'framechecker_error': str(e)}, 'framechecker')
+        
+
+@click.command()
+@click.argument('input-file', 
+                type=str, nargs=-1)
+@click.option('--no-obabel-run', '-n', help='Disable obabel pre conversion for the file', 
+              type=bool, default=False, is_flag=True)
+@click.option('--recursive', '-r', help='Process directories recursively', 
+              type=bool, default=False, is_flag=True)
+@click.option('--total-timeout', '-t', 
+              help='Total execution timeout (seconds). Controls the maximum time for the entire analysis. Default 300.', 
+              type=int, default=300)
+@click.option('--max-workers', '-w',
+              help='Maximum number of parallel workers. Defaults to number of CPU cores.',
+              type=int, default=None)
+@click.option('--output-dir', '-o',
+              help='Directory to store results. Output for each CIF is placed in a subdirectory named after the CIF.',
+              type=click.Path(file_okay=False, dir_okay=True, resolve_path=True), default=None)
+def sanity_runner(input_file : str, 
+                  no_obabel_run : bool,
+                  recursive : bool,
+                  total_timeout : int,
+                  max_workers: Optional[int],
+                  output_dir: str) -> None:
+    '''Sanity check runner for CIF files, directories, or multiple files.
+    
+    Processes single files, multiple files, or entire directories containing CIF files.
+    All reports are written to the provided output directory under a subdirectory
+    named after each CIF file.
+    
+    The --total-timeout option controls the maximum execution time for the entire analysis.
+    When exceeded, the analysis stops immediately and saves partial results.
+
+    Examples:
+
+Process single file:     sanity_runner structure.cif
+
+Process with 60s timeout: sanity_runner -t 60 structure.cif  
+
+Process multiple files:  sanity_runner file1.cif file2.cif
+
+Process directory:       sanity_runner /path/to/cif_folder/
+
+Process recursively:     sanity_runner -r /path/to/cif_folder/
+    '''
+    timeout_config = TimeoutConfig(
+        total_execution=total_timeout,
+        platon=120,  # Individual timeouts are no longer used but kept for subprocess calls
+        libcif=60,
+        framechecker=180,
+        preprocessing=60
+    )
+    
+    # Collect all CIF files from input (files, directories, or mixed)
+    if not input_file:
+        click.echo("Error: No input files or directories specified.", err=True)
+        return
+    
+    cif_files = collect_cif_files(list(input_file), recursive)
+    
+    if not cif_files:
+        click.echo("Error: No CIF files found to process.", err=True)
+        return
+    
+    total_files = len(cif_files)
+    click.echo(f"Processing {total_files} CIF file(s)...")
+
+    # Set default output directory if not specified
+    if output_dir is None:
+        if len(input_file) == 1:
+            input_path = Path(input_file[0])
+            if input_path.is_file():
+                base_name = input_path.stem
+            else:
+                base_name = input_path.name
+            output_dir = f"{base_name}_sanity_results"
+        else:
+            output_dir = "input_sanity_results"
+    
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    
+    # Invert obabel logic: obabel_run is True by default unless --no-obabel-run is specified
+    obabel_run = not no_obabel_run
+
+    if max_workers is None:
+        available_cpus = os.cpu_count() or 1
+        max_workers = min(total_files, available_cpus)
+    else:
+        if max_workers < 1:
+            click.echo("Error: --max-workers must be a positive integer.", err=True)
+            return
+        max_workers = min(max_workers, total_files)
+
+    failures = []
+
+    if max_workers == 1:
+        for file in tqdm(cif_files, desc="Processing CIF files"):
+            result = sanity(file, timeout_config, obabel_run, output_root)
+            if result:
+                failures.append((file, result))
+        if failures:
+            click.echo(
+                f"Completed with issues in {len(failures)} file(s). See individual logs for details.",
+                err=True,
+            )
+        return
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_to_file = {
+            executor.submit(sanity, file, timeout_config, obabel_run, output_root): file
+            for file in cif_files
+        }
+
+        with tqdm(total=total_files, desc="Processing CIF files") as progress:
+            for future in as_completed(future_to_file):
+                file = future_to_file[future]
+                try:
+                    result = future.result()
+                    if result:
+                        failures.append((file, result))
+                except Exception as exc:
+                    failures.append((file, exc))
+                    logger.error(f"Error processing {file}: {exc}")
+                finally:
+                    progress.update(1)
+
+    if failures:
+        click.echo(
+            f"Completed with issues in {len(failures)} file(s). See individual logs for details.",
+            err=True,
+        )
+
+def sanity(input_file : str, 
+           timeout_config : TimeoutConfig, 
+           obabel_run : bool,
+           output_root: Path ) -> int:
+    input_path = Path(input_file)
+
+    # Create main output directory structure with 4 top-level subdirectories
+    babel_cifs_dir = output_root / "babel_cifs"
+    p1_cifs_dir = output_root / "p1_cifs"
+    symm_cifs_dir = output_root / "symm_cifs"
+    results_dir = output_root / "results"
+    
+    # Create all main subdirectories
+    for subdir in [babel_cifs_dir, p1_cifs_dir, symm_cifs_dir, results_dir]:
+        subdir.mkdir(parents=True, exist_ok=True)
+
+    # Create individual result directory for this CIF
+    cif_result_dir = results_dir / input_path.stem
+    cif_result_dir.mkdir(parents=True, exist_ok=True)
+
+    log_file = cif_result_dir / f"{input_path.stem}.log"
+    output_file = cif_result_dir / f"{input_path.stem}.json"
+    
+    # Remove all existing handlers from the root logger
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+    
+    # Configure logging for this specific file
+    logging.basicConfig(filename=log_file, 
+                        filemode='w',
+                        level=logging.INFO,
+                        format='%(asctime)s %(levelname)-8s %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S',
+                        force=True)
+    
+    logging.info(f"Started with i:{input_file}, o:{output_file}, l:{log_file}, timeouts:{timeout_config}, babel:{obabel_run}")
+    if not (input_path.exists() and input_path.is_file()):
+           logging.critical(f"Input file '{input_file}' does not exists or is not a file.")
+           return 0
+
+    json_data = {}
+
+    # Prepare CIF directories for FileStructure
+    cif_dirs = {
+        'babel_cifs': babel_cifs_dir,
+        'p1_cifs': p1_cifs_dir,
+        'symm_cifs': symm_cifs_dir
+    }
+
+    timeout_occurred = False
+    try:
+        with flexible_timeout(timeout_config.total_execution, "total execution", global_timeout=True):
+            procedures(json_data, input_path, obabel_run, output_file, timeout_config, cif_dirs)
+    except (GlobalTimeoutException, KeyboardInterrupt) as e:
+        logger.error(f"Total execution timeout exceeded {timeout_config.total_execution}s. Stopping analysis.")
+        timeout_occurred = True
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+
+    # Only write output file - don't continue with any more processing
+    with open(output_file, 'w') as f:
+         json.dump(json_data, f)
+    
+    if timeout_occurred:
+        logger.info(f"Analysis terminated due to timeout. Partial results saved to {output_file}")
+        return 1  # Exit with error code to indicate timeout
+
+    return 0
+
+if __name__ == "__main__":
+    sanity_runner()
