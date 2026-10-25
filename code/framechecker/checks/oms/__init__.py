@@ -53,7 +53,7 @@ class FrameOMS(AbstractIndexCheck):
 
     @classmethod
     def from_framechecker(cls, framechecker):
-        """Initialize a OMS check from a framechecker instance."""
+        """Initialize an OMS check from a framechecker instance."""
         checker = cls(framechecker.structure, framechecker.graph)
         checker.get_cn = framechecker.get_cn
         return checker

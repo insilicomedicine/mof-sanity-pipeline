@@ -67,7 +67,7 @@ class UnderCoordinatedNitrogenCheck(BaseMissingCheck):
             cn = self.get_cn(site_index)  # pylint:disable=invalid-name
             neighbors = self.get_connected_sites(site_index)
             if cn == 1:
-                # this is suspicous, but it also might a CN which is perfectly fine.
+                # this is suspicious, but it also might be a CN which is perfectly fine.
                 # to check this, we first see if the neighbor is carbon
                 # and then what its coordination number is. If it is greater than 2
                 # then we likely do not have a CN for which the carbon should be a

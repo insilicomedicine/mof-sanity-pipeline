@@ -74,7 +74,7 @@ class UnderCoordinatedCarbonCheck(BaseMissingCheck):
             cn = self.get_cn(site_index)  # pylint:disable=invalid-name
             neighbors = self.get_connected_sites(site_index)
             if cn == 1:
-                # this will fail for alkine
+                # this will fail for alkyne
                 undercoordinated_carbons.append(site_index)
                 # make it sp3
                 h_positions.append(add_sp3_hydrogens_on_cn1(self.structure[site_index], neighbors))
@@ -87,6 +87,6 @@ class UnderCoordinatedCarbonCheck(BaseMissingCheck):
 
                     h_positions.append(add_sp2_hydrogen(self.structure[site_index], neighbors))
 
-            # i wond't catch CN3 as this would need careful evaluation of the bond order
+            # i won't catch CN3 as this would need careful evaluation of the bond order
 
         return undercoordinated_carbons, h_positions

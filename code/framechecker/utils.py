@@ -51,7 +51,7 @@ def read_pickle(file: PathType):
 
 def _check_metal_coordination(site, coordination_number: int) -> bool:
     # Lanthanides like to have many neighbors
-    # Low coordinatio number is usually only
+    # Low coordination number is usually only
     # possible with really bulky ligands
     # for this reason, a Lanthanide with low
     # coordination number, e.g., <= 4 can be considered "interesting"

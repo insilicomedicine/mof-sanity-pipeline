@@ -54,7 +54,7 @@ class HasNitrogen(AbstractCheck):
     @property
     def name(self):
         """Return the name of the check."""
-        return "Contains carbon"
+        return "Contains nitrogen"
 
     @property
     def description(self):

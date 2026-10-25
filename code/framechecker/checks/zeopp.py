@@ -70,7 +70,7 @@ def _parse_zeopp(filecontent: str) -> dict:
 
     Returns:
         dict: largest included sphere, largest free sphere,
-            largest included sphera along free sphere path
+            largest included sphere along free sphere path
     """
     first_line = filecontent.split("\n")[0]
     parts = first_line.split()
